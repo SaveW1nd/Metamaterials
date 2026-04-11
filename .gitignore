@@ -1,0 +1,8 @@
+.omx/
+.serena/
+.pytest_cache/
+.claude/
+artifacts/
+src/artifacts/
+__pycache__/
+*.pyc

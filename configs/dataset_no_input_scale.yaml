@@ -1,0 +1,71 @@
+output_dir: artifacts/demo_dataset_no_input_scale
+train_samples: 6200
+val_samples: 775
+test_samples: 775
+seed: 20260325
+sample_rate_hz: 100000000.0
+num_samples: 4000
+bandwidth_hz: 40000000.0
+pulse_width_s: 0.00004
+carrier_hz: 0.0
+target_delay_s: 0.0
+jammer_delay_s: 0.0
+fixed_snr_db: 0.0
+jnr_db_range: [-10.0, 20.0]
+jnr_discrete_values:
+  - -10.0
+  - -9.0
+  - -8.0
+  - -7.0
+  - -6.0
+  - -5.0
+  - -4.0
+  - -3.0
+  - -2.0
+  - -1.0
+  - 0.0
+  - 1.0
+  - 2.0
+  - 3.0
+  - 4.0
+  - 5.0
+  - 6.0
+  - 7.0
+  - 8.0
+  - 9.0
+  - 10.0
+  - 11.0
+  - 12.0
+  - 13.0
+  - 14.0
+  - 15.0
+  - 16.0
+  - 17.0
+  - 18.0
+  - 19.0
+  - 20.0
+train_samples_per_jnr: 200
+val_samples_per_jnr: 25
+test_samples_per_jnr: 25
+min_interval_gap_us: 0.2
+duty_sampling_strategy: balanced_bins
+duty_bins:
+  - [0.05, 0.20]
+  - [0.20, 0.35]
+  - [0.35, 0.55]
+  - [0.55, 0.85]
+duty_sampling_attempts: 64
+input_representation: iq2
+use_input_scale: false
+third_channel_mode: mag_log
+third_channel_smoothing_window: 9
+scaler:
+  slice_width_us:
+    min_value: 0.4
+    max_value: 4.0
+  sampling_interval_us:
+    min_value: 1.0
+    max_value: 10.0
+  modulation_floor:
+    min_value: 0.0
+    max_value: 0.5

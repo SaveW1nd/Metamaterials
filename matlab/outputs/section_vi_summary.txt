@@ -1,0 +1,14 @@
+Single-case expected spacing (m): 29.979246
+Single-case detected ranges (m): 5935.515928 5965.495174 5995.474419 6025.453665 6055.432911 
+
+Frequency sweep actual spacing (m)
+f_s=0.500 MHz -> actual=14.989623, expected=14.989623
+f_s=1.000 MHz -> actual=29.979246, expected=29.979246
+f_s=2.000 MHz -> actual=59.958492, expected=59.958492
+f_s=4.000 MHz -> actual=119.916983, expected=119.916983
+
+Duty-cycle sweep metrics
+alpha=0.2 -> zero=4485.400000, first/zero=0.593039
+alpha=0.4 -> zero=7367.200000, first/zero=0.588091
+alpha=0.6 -> zero=10245.400000, first/zero=0.424528
+alpha=0.8 -> zero=13126.300000, first/zero=0.206098
