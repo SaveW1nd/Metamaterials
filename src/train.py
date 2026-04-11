@@ -239,6 +239,8 @@ def _run_epoch(
                 gate_tv_weight=training_config.gate_tv_weight,
                 plateau_loss_weight=training_config.plateau_loss_weight,
                 platform_consistency_weight=training_config.platform_consistency_weight,
+                x_decode_mode=_resolve_x_decode_mode(training_config),
+                x_mix_alpha=_resolve_x_mix_alpha(training_config),
             )
 
             if train_mode:
@@ -254,6 +256,8 @@ def _run_epoch(
                 sample_rate_hz=float(dataset_config["sample_rate_hz"]),
                 seq_len=jammer_mask.shape[-1],
                 jammer_delay_s=float(dataset_config["jammer_delay_s"]),
+                x_decode_mode=_resolve_x_decode_mode(training_config),
+                x_mix_alpha=_resolve_x_mix_alpha(training_config),
             )
             total_loss += float(loss_output.total.item()) * iq.shape[0]
             predictions_all.append(decoded.as_physical_tensor().detach().cpu())
@@ -299,6 +303,8 @@ def _run_epoch(
         + metrics["slice_width_mae_us"]
         + metrics["modulation_floor_mae"]
     )
+    metrics["x_decode_mode"] = _resolve_x_decode_mode(training_config)
+
     confidence_outputs = compute_confidence_outputs(
         predictions_np,
         scaler,
@@ -442,6 +448,24 @@ def _resolve_min_timing_gap_us(training_config: TrainingConfig | dict) -> float:
     if isinstance(training_config, dict):
         return float(training_config.get("min_timing_gap_us", training_config.get("gap_min_us", 0.2)))
     return float(training_config.min_timing_gap_us)
+
+
+def _resolve_x_decode_mode(training_config: TrainingConfig | dict) -> str:
+    if isinstance(training_config, dict):
+        model_config = training_config.get("model", {})
+        if isinstance(model_config, dict):
+            return str(model_config.get("x_decode_mode", "head"))
+        return "head"
+    return str(training_config.model.x_decode_mode)
+
+
+def _resolve_x_mix_alpha(training_config: TrainingConfig | dict) -> float:
+    if isinstance(training_config, dict):
+        model_config = training_config.get("model", {})
+        if isinstance(model_config, dict):
+            return float(model_config.get("x_mix_alpha", 0.5))
+        return 0.5
+    return float(training_config.model.x_mix_alpha)
 
 
 def _training_config_from_checkpoint(training_config: dict) -> TrainingConfig:

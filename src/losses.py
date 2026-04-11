@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from config import ParameterScaler
-from model import ParameterMaskPredictions, TwoStagePredictions
+from model import GateReconstructionPredictions, TwoStagePredictions
 
 
 @dataclass
@@ -25,7 +25,14 @@ class DecodedPredictions:
     slice_width_us: torch.Tensor
     sampling_interval_us: torch.Tensor
     modulation_floor: torch.Tensor
+    gate_period: torch.Tensor | None = None
     mask_full: torch.Tensor | None = None
+    duty_soft: torch.Tensor | None = None
+    x_head: torch.Tensor | None = None
+    x_template: torch.Tensor | None = None
+    x_final: torch.Tensor | None = None
+    low_platform_period: torch.Tensor | None = None
+    low_platform_full: torch.Tensor | None = None
 
     def as_physical_tensor(self) -> torch.Tensor:
         return torch.cat(
@@ -39,7 +46,7 @@ class DecodedPredictions:
 
 
 def compute_parameter_loss(
-    predictions_raw: TwoStagePredictions | ParameterMaskPredictions,
+    predictions_raw: TwoStagePredictions | GateReconstructionPredictions,
     targets: torch.Tensor,
     jammer_iq: torch.Tensor,
     *,
@@ -59,17 +66,25 @@ def compute_parameter_loss(
     gate_tv_weight: float = 0.02,
     plateau_loss_weight: float = 0.0,
     platform_consistency_weight: float = 0.0,
+    x_decode_mode: str = "head",
+    x_mix_alpha: float = 0.5,
 ) -> LossOutput:
-    if isinstance(predictions_raw, ParameterMaskPredictions):
-        return _compute_parameter_mask_loss(
+    if isinstance(predictions_raw, GateReconstructionPredictions):
+        return _compute_gate_reconstruction_loss(
             predictions_raw=predictions_raw,
             targets=targets,
             jammer_mask=jammer_mask,
             scaler=scaler,
             sample_rate_hz=sample_rate_hz,
             jammer_delay_s=jammer_delay_s,
+            min_timing_gap_us=min_timing_gap_us,
             parameter_loss_weights=parameter_loss_weights,
             mask_reconstruction_weight=mask_reconstruction_weight,
+            gate_tv_weight=gate_tv_weight,
+            plateau_loss_weight=plateau_loss_weight,
+            platform_consistency_weight=platform_consistency_weight,
+            x_decode_mode=x_decode_mode,
+            x_mix_alpha=x_mix_alpha,
         )
     return _compute_two_stage_parameter_loss(
         predictions_raw=predictions_raw,
@@ -90,21 +105,26 @@ def compute_parameter_loss(
 
 
 def decode_predictions(
-    predictions_raw: TwoStagePredictions | ParameterMaskPredictions,
+    predictions_raw: TwoStagePredictions | GateReconstructionPredictions,
     scaler: ParameterScaler,
     min_timing_gap_us: float,
     parameterization: str = "duty",
     sample_rate_hz: float | None = None,
     seq_len: int | None = None,
     jammer_delay_s: float = 0.0,
+    x_decode_mode: str = "head",
+    x_mix_alpha: float = 0.5,
 ) -> DecodedPredictions:
-    if isinstance(predictions_raw, ParameterMaskPredictions):
-        return _decode_parameter_mask_predictions(
+    if isinstance(predictions_raw, GateReconstructionPredictions):
+        return _decode_gate_predictions(
             predictions_raw=predictions_raw,
             scaler=scaler,
+            min_timing_gap_us=min_timing_gap_us,
             sample_rate_hz=sample_rate_hz,
             seq_len=seq_len,
             jammer_delay_s=jammer_delay_s,
+            x_decode_mode=x_decode_mode,
+            x_mix_alpha=x_mix_alpha,
         )
     return _decode_two_stage_predictions(
         predictions_raw=predictions_raw,
@@ -115,17 +135,21 @@ def decode_predictions(
 
 
 def compute_metrics(
-    predictions_raw: TwoStagePredictions | ParameterMaskPredictions,
+    predictions_raw: TwoStagePredictions | GateReconstructionPredictions,
     targets: torch.Tensor,
     scaler: ParameterScaler,
     min_timing_gap_us: float,
     parameterization: str = "duty",
+    x_decode_mode: str = "head",
+    x_mix_alpha: float = 0.5,
 ) -> dict[str, float]:
     predictions = decode_predictions(
         predictions_raw,
         scaler,
         min_timing_gap_us,
         parameterization=parameterization,
+        x_decode_mode=x_decode_mode,
+        x_mix_alpha=x_mix_alpha,
     ).as_physical_tensor()
     mae = torch.mean(torch.abs(predictions - targets), dim=0)
     rmse = torch.sqrt(torch.mean((predictions - targets) ** 2, dim=0))
@@ -283,25 +307,34 @@ def _compute_two_stage_parameter_loss(
     return LossOutput(total=total, regression=regression, ordering=ordering, consistency=consistency)
 
 
-def _compute_parameter_mask_loss(
-    predictions_raw: ParameterMaskPredictions,
+def _compute_gate_reconstruction_loss(
+    predictions_raw: GateReconstructionPredictions,
     targets: torch.Tensor,
     jammer_mask: torch.Tensor | None,
     scaler: ParameterScaler,
     sample_rate_hz: float,
     jammer_delay_s: float,
+    min_timing_gap_us: float,
     parameter_loss_weights: tuple[float, float, float],
     mask_reconstruction_weight: float,
+    gate_tv_weight: float,
+    plateau_loss_weight: float,
+    platform_consistency_weight: float,
+    x_decode_mode: str,
+    x_mix_alpha: float,
 ) -> LossOutput:
     if jammer_mask is None:
-        raise ValueError("jammer_mask is required for parameter-mask loss.")
+        raise ValueError("jammer_mask is required for gate reconstruction loss.")
 
-    decoded = _decode_parameter_mask_predictions(
+    decoded = _decode_gate_predictions(
         predictions_raw=predictions_raw,
         scaler=scaler,
+        min_timing_gap_us=min_timing_gap_us,
         sample_rate_hz=sample_rate_hz,
         seq_len=jammer_mask.shape[-1],
         jammer_delay_s=jammer_delay_s,
+        x_decode_mode=x_decode_mode,
+        x_mix_alpha=x_mix_alpha,
     )
     physical_predictions = decoded.as_physical_tensor()
     weights = torch.tensor(parameter_loss_weights, dtype=targets.dtype, device=targets.device).view(1, 3)
@@ -309,9 +342,31 @@ def _compute_parameter_mask_loss(
     regression = regression_terms.mean()
 
     reconstruction = F.smooth_l1_loss(decoded.mask_full, jammer_mask)
-    total = regression + mask_reconstruction_weight * reconstruction
-    zero = regression.new_tensor(0.0)
-    return LossOutput(total=total, regression=regression, ordering=reconstruction, consistency=zero)
+    plateau = decoded.mask_full.new_tensor(0.0)
+    if plateau_loss_weight > 0:
+        pred_low_mean = _estimate_template_floor_from_mask(decoded.mask_full, decoded.x_head)
+        true_low_mean = _estimate_template_floor_from_mask(jammer_mask, targets[:, 2:3])
+        plateau = F.smooth_l1_loss(pred_low_mean, true_low_mean)
+    platform_consistency = decoded.mask_full.new_tensor(0.0)
+    if platform_consistency_weight > 0 and decoded.low_platform_full is not None:
+        true_floor = targets[:, 2:3]
+        true_gate = ((jammer_mask - true_floor) / (1.0 - true_floor).clamp_min(1e-6)).clamp(0.0, 1.0)
+        true_low_weight = 1.0 - true_gate
+        platform_consistency = _weighted_smooth_l1(
+            decoded.low_platform_full,
+            jammer_mask,
+            true_low_weight,
+        )
+
+    tv = torch.mean(torch.abs(decoded.gate_period[:, 1:] - decoded.gate_period[:, :-1]))
+    total = (
+        regression
+        + mask_reconstruction_weight * reconstruction
+        + gate_tv_weight * tv
+        + plateau_loss_weight * plateau
+        + platform_consistency_weight * platform_consistency
+    )
+    return LossOutput(total=total, regression=regression, ordering=reconstruction, consistency=tv)
 
 
 def _decode_two_stage_predictions(
@@ -354,59 +409,210 @@ def _decode_two_stage_predictions(
     )
 
 
-def _decode_parameter_mask_predictions(
-    predictions_raw: ParameterMaskPredictions,
+def _decode_gate_predictions(
+    predictions_raw: GateReconstructionPredictions,
     scaler: ParameterScaler,
+    min_timing_gap_us: float,
     sample_rate_hz: float | None = None,
     seq_len: int | None = None,
     jammer_delay_s: float = 0.0,
+    x_decode_mode: str = "head",
+    x_mix_alpha: float = 0.5,
 ) -> DecodedPredictions:
-    slice_width_us = predictions_raw.slice_width_us.clamp_min(1e-6)
-    sampling_interval_us = torch.maximum(
-        predictions_raw.sampling_interval_us,
-        slice_width_us + 1e-6,
+    ts_norm = predictions_raw.ts_norm.clamp(0.0, 1.0)
+    x_norm = predictions_raw.x_norm.clamp(0.0, 1.0)
+    gate_period = predictions_raw.gate_period.clamp(0.0, 1.0)
+    low_platform_norm = (
+        predictions_raw.low_platform_norm.clamp(0.0, 1.0)
+        if predictions_raw.low_platform_norm is not None
+        else None
     )
-    modulation_floor = predictions_raw.modulation_floor.clamp(0.0, 1.0)
+
+    ts_min = scaler.sampling_interval_us.min_value
+    ts_max = scaler.sampling_interval_us.max_value
+    x_min = scaler.modulation_floor.min_value
+    x_max = scaler.modulation_floor.max_value
+    tl_min = scaler.slice_width_us.min_value
+    tl_max = scaler.slice_width_us.max_value
+
+    sampling_interval_us = ts_norm * (ts_max - ts_min) + ts_min
+    x_head = x_norm * (x_max - x_min) + x_min
+    low_platform_period = (
+        low_platform_norm * (x_max - x_min) + x_min
+        if low_platform_norm is not None
+        else None
+    )
+    duty_soft = torch.mean(gate_period, dim=1, keepdim=True)
+    slice_width_us = duty_soft * sampling_interval_us
+    slice_width_high = torch.minimum(
+        torch.full_like(slice_width_us, tl_max),
+        (sampling_interval_us - min_timing_gap_us).clamp_min(tl_min),
+    )
+    slice_width_us = torch.minimum(torch.maximum(slice_width_us, torch.full_like(slice_width_us, tl_min)), slice_width_high)
+
     mask_full = None
+    x_template = x_head
+    modulation_floor = x_head
+    low_platform_full = None
     if sample_rate_hz is not None and seq_len is not None:
-        mask_full = _build_mask_from_parameters(
-            slice_width_us=slice_width_us,
+        gate_full = _interpolate_period_values(
+            period_values=gate_period,
             sampling_interval_us=sampling_interval_us,
-            modulation_floor=modulation_floor,
             seq_len=seq_len,
             sample_rate_hz=sample_rate_hz,
             jammer_delay_s=jammer_delay_s,
         )
+        if low_platform_period is not None:
+            low_platform_full = _interpolate_period_values(
+                period_values=low_platform_period,
+                sampling_interval_us=sampling_interval_us,
+                seq_len=seq_len,
+                sample_rate_hz=sample_rate_hz,
+                jammer_delay_s=jammer_delay_s,
+            ).clamp(x_min, x_max)
+            x_template = _estimate_template_floor_from_period(
+                gate_period=gate_period,
+                low_platform_period=low_platform_period,
+                fallback=x_head,
+            ).clamp(x_min, x_max)
+        else:
+            initial_mask = _build_mask_from_gate_period(
+                gate_period=gate_period,
+                sampling_interval_us=sampling_interval_us,
+                modulation_floor=x_head,
+                seq_len=seq_len,
+                sample_rate_hz=sample_rate_hz,
+                jammer_delay_s=jammer_delay_s,
+            )
+            x_template = _estimate_template_floor_from_mask(initial_mask, x_head).clamp(x_min, x_max)
+
+        mode = str(x_decode_mode).lower()
+        if mode == "template" and low_platform_period is not None:
+            modulation_floor = x_template
+        elif mode == "template_mix":
+            alpha = float(max(0.0, min(1.0, x_mix_alpha)))
+            modulation_floor = (alpha * x_head + (1.0 - alpha) * x_template).clamp(x_min, x_max)
+        else:
+            modulation_floor = x_head
+        if low_platform_full is not None and mode == "template":
+            mask_full = low_platform_full + (1.0 - low_platform_full) * gate_full
+        else:
+            mask_full = _build_mask_from_gate_period(
+                gate_period=gate_period,
+                sampling_interval_us=sampling_interval_us,
+                modulation_floor=modulation_floor,
+                seq_len=seq_len,
+                sample_rate_hz=sample_rate_hz,
+                jammer_delay_s=jammer_delay_s,
+            )
 
     return DecodedPredictions(
-        ts_norm=torch.zeros_like(slice_width_us),
-        timing_param=torch.zeros_like(slice_width_us),
-        x_norm=modulation_floor,
+        ts_norm=ts_norm,
+        timing_param=duty_soft,
+        x_norm=x_norm,
         slice_width_us=slice_width_us,
         sampling_interval_us=sampling_interval_us,
         modulation_floor=modulation_floor,
+        gate_period=gate_period,
         mask_full=mask_full,
+        duty_soft=duty_soft,
+        x_head=x_head,
+        x_template=x_template,
+        x_final=modulation_floor,
+        low_platform_period=low_platform_period,
+        low_platform_full=low_platform_full,
     )
 
 
-def _build_mask_from_parameters(
-    slice_width_us: torch.Tensor,
+def _build_mask_from_gate_period(
+    gate_period: torch.Tensor,
     sampling_interval_us: torch.Tensor,
     modulation_floor: torch.Tensor,
     seq_len: int,
     sample_rate_hz: float,
     jammer_delay_s: float,
-    sharpness: float = 18.0,
 ) -> torch.Tensor:
-    dtype = slice_width_us.dtype
-    device = slice_width_us.device
+    batch_size, gate_bins = gate_period.shape
+    dtype = gate_period.dtype
+    device = gate_period.device
     time_us = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(0) / sample_rate_hz * 1e6
     relative_us = time_us - jammer_delay_s * 1e6
     phase_norm = torch.remainder(relative_us.clamp_min(0.0), sampling_interval_us.clamp_min(1e-6)) / sampling_interval_us.clamp_min(1e-6)
-    duty_ratio = slice_width_us / sampling_interval_us.clamp_min(1e-6)
-    active = torch.sigmoid(relative_us * sharpness)
-    soft_gate = torch.sigmoid((duty_ratio - phase_norm) * sharpness) * active
-    return modulation_floor + (1.0 - modulation_floor) * soft_gate
+    position = phase_norm * max(gate_bins - 1, 1)
+    index_low = torch.floor(position).long().clamp(0, max(gate_bins - 1, 0))
+    index_high = (index_low + 1).clamp(0, max(gate_bins - 1, 0))
+    alpha = (position - index_low.to(dtype)).clamp(0.0, 1.0)
+
+    gate_low = torch.gather(gate_period, 1, index_low)
+    gate_high = torch.gather(gate_period, 1, index_high)
+    interpolated = gate_low + alpha * (gate_high - gate_low)
+    return modulation_floor + (1.0 - modulation_floor) * interpolated
+
+
+def _interpolate_period_values(
+    period_values: torch.Tensor,
+    sampling_interval_us: torch.Tensor,
+    seq_len: int,
+    sample_rate_hz: float,
+    jammer_delay_s: float,
+) -> torch.Tensor:
+    batch_size, gate_bins = period_values.shape
+    dtype = period_values.dtype
+    device = period_values.device
+    time_us = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(0) / sample_rate_hz * 1e6
+    relative_us = time_us - jammer_delay_s * 1e6
+    phase_norm = torch.remainder(relative_us.clamp_min(0.0), sampling_interval_us.clamp_min(1e-6)) / sampling_interval_us.clamp_min(1e-6)
+    position = phase_norm * max(gate_bins - 1, 1)
+    index_low = torch.floor(position).long().clamp(0, max(gate_bins - 1, 0))
+    index_high = (index_low + 1).clamp(0, max(gate_bins - 1, 0))
+    alpha = (position - index_low.to(dtype)).clamp(0.0, 1.0)
+
+    value_low = torch.gather(period_values, 1, index_low)
+    value_high = torch.gather(period_values, 1, index_high)
+    return value_low + alpha * (value_high - value_low)
+
+
+def _estimate_template_floor_from_mask(
+    mask_full: torch.Tensor,
+    fallback: torch.Tensor,
+    low_fraction: float = 0.25,
+    min_candidates: int = 16,
+) -> torch.Tensor:
+    if mask_full.ndim != 2:
+        return fallback
+
+    seq_len = int(mask_full.shape[1])
+    if seq_len <= 0:
+        return fallback
+
+    k = min(seq_len, max(int(round(seq_len * low_fraction)), min_candidates))
+    if k <= 0:
+        return fallback
+
+    low_values, _ = torch.topk(mask_full, k=k, dim=1, largest=False, sorted=False)
+    return low_values.mean(dim=1, keepdim=True)
+
+
+def _estimate_template_floor_from_period(
+    gate_period: torch.Tensor,
+    low_platform_period: torch.Tensor,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    low_weight = (1.0 - gate_period).clamp_min(0.0)
+    denom = low_weight.sum(dim=1, keepdim=True)
+    weighted_mean = (low_platform_period * low_weight).sum(dim=1, keepdim=True) / denom.clamp_min(1e-6)
+    use_fallback = denom <= 1e-6
+    return torch.where(use_fallback, fallback, weighted_mean)
+
+
+def _weighted_smooth_l1(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    elementwise = F.smooth_l1_loss(prediction, target, reduction="none")
+    weighted = elementwise * weight
+    return weighted.sum() / weight.sum().clamp_min(1e-6)
 
 
 def _build_stage_mask(stage: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:

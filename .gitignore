@@ -6,3 +6,8 @@ artifacts/
 src/artifacts/
 __pycache__/
 *.pyc
+*.aux
+*.log
+*.fls
+*.fdb_latexmk
+*.synctex.gz

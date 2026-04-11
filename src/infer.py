@@ -42,6 +42,8 @@ def predict_from_dataset(checkpoint_path: str | Path, data_path: str | Path, ind
             sample_rate_hz=float(checkpoint["dataset_config"]["sample_rate_hz"]),
             seq_len=int(batch["jammer_mask"].shape[-1]),
             jammer_delay_s=float(checkpoint["dataset_config"]["jammer_delay_s"]),
+            x_decode_mode=_resolve_x_decode_mode(checkpoint),
+            x_mix_alpha=_resolve_x_mix_alpha(checkpoint),
         )
 
     labels = batch["labels"]
@@ -57,8 +59,16 @@ def predict_from_dataset(checkpoint_path: str | Path, data_path: str | Path, ind
             "modulation_floor": float(labels[2].item()),
         },
     }
+    if decoded.gate_period is not None:
+        result["gate_period"] = decoded.gate_period.squeeze(0).cpu().tolist()
     if decoded.mask_full is not None:
         result["mask_full"] = decoded.mask_full.squeeze(0).cpu().tolist()
+    if decoded.x_head is not None:
+        result["x_head"] = float(decoded.x_head.squeeze(0).item())
+    if decoded.x_template is not None:
+        result["x_template"] = float(decoded.x_template.squeeze(0).item())
+    if decoded.x_final is not None:
+        result["x_final"] = float(decoded.x_final.squeeze(0).item())
     return result
 
 
@@ -71,6 +81,7 @@ def evaluate_dataset(checkpoint_path: str | Path, data_path: str | Path, batch_s
 
     predictions_all = []
     targets_all = []
+    x_template_all = []
     for batch in loader:
         iq = batch["iq"].to(runtime_device)
         with torch.no_grad():
@@ -82,14 +93,22 @@ def evaluate_dataset(checkpoint_path: str | Path, data_path: str | Path, batch_s
                 sample_rate_hz=float(checkpoint["dataset_config"]["sample_rate_hz"]),
                 seq_len=int(batch["jammer_mask"].shape[-1]),
                 jammer_delay_s=float(checkpoint["dataset_config"]["jammer_delay_s"]),
+                x_decode_mode=_resolve_x_decode_mode(checkpoint),
+                x_mix_alpha=_resolve_x_mix_alpha(checkpoint),
             )
         predictions_all.append(decoded.as_physical_tensor().cpu())
         targets_all.append(batch["labels"].cpu())
+        if decoded.x_template is not None:
+            x_template_all.append(decoded.x_template.cpu())
 
     predictions = torch.cat(predictions_all, dim=0).numpy()
     targets_np = torch.cat(targets_all, dim=0).numpy()
     abs_error = np.abs(predictions - targets_np)
     sq_error = (predictions - targets_np) ** 2
+    x_template_mae = None
+    if x_template_all:
+        x_template = torch.cat(x_template_all, dim=0).numpy().reshape(-1)
+        x_template_mae = float(np.mean(np.abs(x_template - targets_np[:, 2])))
 
     hit_tl = abs_error[:, 0] <= 0.15
     hit_ts = abs_error[:, 1] <= 0.25
@@ -113,6 +132,8 @@ def evaluate_dataset(checkpoint_path: str | Path, data_path: str | Path, batch_s
 
     return {
         "num_samples": int(targets_np.shape[0]),
+        "x_decode_mode": _resolve_x_decode_mode(checkpoint),
+        "x_template_mae": x_template_mae,
         "slice_width": _summarize_error(abs_error[:, 0], sq_error[:, 0], hit_tl),
         "sampling_interval": _summarize_error(abs_error[:, 1], sq_error[:, 1], hit_ts),
         "modulation_floor": _summarize_error(abs_error[:, 2], sq_error[:, 2], hit_x),
@@ -169,6 +190,20 @@ def _resolve_min_timing_gap_us(training_config: dict) -> float:
 
 def _resolve_parameterization(training_config: dict) -> str:
     return str(training_config.get("parameterization", "duty"))
+
+
+def _resolve_x_decode_mode(checkpoint: dict) -> str:
+    model_config = checkpoint.get("model_config", {})
+    if isinstance(model_config, dict):
+        return str(model_config.get("x_decode_mode", "head"))
+    return "head"
+
+
+def _resolve_x_mix_alpha(checkpoint: dict) -> float:
+    model_config = checkpoint.get("model_config", {})
+    if isinstance(model_config, dict):
+        return float(model_config.get("x_mix_alpha", 0.5))
+    return 0.5
 
 
 def _compute_low_jnr_joint_hit_rate(manifest: dict, split_name: str, count: int, joint_hit: np.ndarray) -> float | None:

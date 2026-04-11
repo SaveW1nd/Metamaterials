@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 from torch import nn
@@ -22,20 +21,17 @@ class TwoStagePredictions:
 
 
 @dataclass
-class ParameterMaskPredictions:
-    slice_width_us: torch.Tensor
-    sampling_interval_us: torch.Tensor
-    modulation_floor: torch.Tensor
+class GateReconstructionPredictions:
+    ts_norm: torch.Tensor
+    x_norm: torch.Tensor
+    gate_period: torch.Tensor
+    low_platform_norm: torch.Tensor | None = None
 
     def as_tensor(self) -> torch.Tensor:
-        return torch.cat(
-            [
-                self.slice_width_us,
-                self.sampling_interval_us,
-                self.modulation_floor,
-            ],
-            dim=1,
-        )
+        tensors = [self.ts_norm, self.x_norm, self.gate_period]
+        if self.low_platform_norm is not None:
+            tensors.append(self.low_platform_norm)
+        return torch.cat(tensors, dim=1)
 
 
 class ConvPatchTokenizer(nn.Module):
@@ -79,11 +75,9 @@ class TransformerStage(nn.Module):
         num_layers: int,
         feedforward_multiplier: float,
         dropout: float,
-        use_cls_token: bool = True,
     ):
         super().__init__()
-        self.use_cls_token = use_cls_token
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_channels)) if use_cls_token else None
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_channels))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_channels,
             nhead=attention_heads,
@@ -96,38 +90,14 @@ class TransformerStage(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(hidden_channels)
 
-    def forward(self, tokens: torch.Tensor) -> tuple[Optional[torch.Tensor], torch.Tensor]:
-        _, seq_len, hidden = tokens.shape
+    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, hidden = tokens.shape
+        cls = self.cls_token.expand(batch_size, -1, -1)
+        cls_pos = torch.zeros(batch_size, 1, hidden, device=tokens.device, dtype=tokens.dtype)
         token_pos = _build_sinusoidal_encoding(seq_len, hidden, tokens.device, tokens.dtype).unsqueeze(0)
-        encoded_inputs = tokens + token_pos
-        if self.use_cls_token:
-            batch_size = tokens.shape[0]
-            cls = self.cls_token.expand(batch_size, -1, -1)
-            cls_pos = torch.zeros(batch_size, 1, hidden, device=tokens.device, dtype=tokens.dtype)
-            encoded_inputs = torch.cat([cls + cls_pos, encoded_inputs], dim=1)
-            encoded = self.norm(self.encoder(encoded_inputs))
-            return encoded[:, 0], encoded[:, 1:]
-        encoded = self.norm(self.encoder(encoded_inputs))
-        return None, encoded
-
-
-class MultiHeadAttentionPooling(nn.Module):
-    def __init__(self, hidden_channels: int, attention_heads: int, dropout: float):
-        super().__init__()
-        self.query = nn.Parameter(torch.zeros(1, 1, hidden_channels))
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_channels,
-            num_heads=attention_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm = nn.LayerNorm(hidden_channels)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        batch_size = tokens.shape[0]
-        query = self.query.expand(batch_size, -1, -1)
-        pooled, _ = self.attn(query=query, key=tokens, value=tokens, need_weights=False)
-        return self.norm(pooled.squeeze(1))
+        encoded = torch.cat([cls + cls_pos, tokens + token_pos], dim=1)
+        encoded = self.norm(self.encoder(encoded))
+        return encoded[:, 0], encoded[:, 1:]
 
 
 class FeatureConditioner(nn.Module):
@@ -285,6 +255,7 @@ class GateReconstructionNet(nn.Module):
     def __init__(self, config: ModelConfig | None = None):
         super().__init__()
         self.config = config or ModelConfig(architecture="gate_reconstruction", input_channels=2)
+        summary_dim = self.config.hidden_channels * 4
 
         self.tokenizer = ConvPatchTokenizer(
             in_channels=self.config.input_channels,
@@ -299,63 +270,61 @@ class GateReconstructionNet(nn.Module):
             num_layers=self.config.shared_transformer_layers,
             feedforward_multiplier=self.config.feedforward_multiplier,
             dropout=self.config.dropout,
-            use_cls_token=False,
         )
-        self.period_pool = MultiHeadAttentionPooling(
-            hidden_channels=self.config.hidden_channels,
-            attention_heads=self.config.attention_heads,
-            dropout=self.config.dropout,
-        )
-        self.width_pool = MultiHeadAttentionPooling(
-            hidden_channels=self.config.hidden_channels,
-            attention_heads=self.config.attention_heads,
-            dropout=self.config.dropout,
-        )
-        self.floor_pool = MultiHeadAttentionPooling(
-            hidden_channels=self.config.hidden_channels,
-            attention_heads=self.config.attention_heads,
-            dropout=self.config.dropout,
-        )
-        self.period_head = nn.Sequential(
-            nn.Linear(self.config.hidden_channels, self.config.hidden_channels),
+        self.ts_head = nn.Sequential(
+            nn.Linear(summary_dim, self.config.hidden_channels),
             nn.GELU(),
             nn.Dropout(self.config.dropout),
-            nn.Linear(self.config.hidden_channels, 1),
-        )
-        self.tl_head = nn.Sequential(
-            nn.Linear(self.config.hidden_channels * 2, self.config.hidden_channels),
+            nn.Linear(self.config.hidden_channels, self.config.ts_embedding_dim),
             nn.GELU(),
-            nn.Dropout(self.config.dropout),
-            nn.Linear(self.config.hidden_channels, 1),
         )
+        self.ts_out = nn.Sequential(
+            nn.Linear(self.config.ts_embedding_dim, 1),
+            nn.Sigmoid(),
+        )
+        gate_input_dim = summary_dim + self.config.ts_embedding_dim
         self.x_head = nn.Sequential(
-            nn.Linear(self.config.hidden_channels * 2, self.config.hidden_channels),
+            nn.Linear(gate_input_dim, self.config.hidden_channels),
             nn.GELU(),
             nn.Dropout(self.config.dropout),
             nn.Linear(self.config.hidden_channels, 1),
+            nn.Sigmoid(),
+        )
+        self.gate_head = nn.Sequential(
+            nn.Linear(gate_input_dim, self.config.hidden_channels),
+            nn.GELU(),
+            nn.Dropout(self.config.dropout),
+            nn.Linear(self.config.hidden_channels, self._gate_head_output_dim()),
+            nn.Sigmoid(),
         )
 
-    def forward(self, iq: torch.Tensor) -> ParameterMaskPredictions:
+    def forward(self, iq: torch.Tensor) -> GateReconstructionPredictions:
         tokens, _ = self.tokenizer(iq)
-        _, shared_tokens = self.shared_encoder(tokens)
-
-        period_context = self.period_pool(shared_tokens)
-        width_context = self.width_pool(shared_tokens)
-        floor_context = self.floor_pool(shared_tokens)
-
-        period_features = period_context
-        width_features = torch.cat([width_context, period_context], dim=1)
-        floor_features = torch.cat([floor_context, period_context], dim=1)
-
-        slice_width_us = torch.nn.functional.softplus(self.tl_head(width_features))
-        positive_gap = torch.nn.functional.softplus(self.period_head(period_features))
-        sampling_interval_us = slice_width_us + positive_gap
-        modulation_floor = torch.sigmoid(self.x_head(floor_features))
-        return ParameterMaskPredictions(
-            slice_width_us=slice_width_us,
-            sampling_interval_us=sampling_interval_us,
-            modulation_floor=modulation_floor,
+        ts_token, shared_tokens = self.shared_encoder(tokens)
+        shared_summary = _summarize_tokens(ts_token, shared_tokens)
+        ts_embedding = self.ts_head(shared_summary)
+        gate_inputs = torch.cat([shared_summary, ts_embedding], dim=1)
+        gate_outputs = self.gate_head(gate_inputs)
+        if self._uses_dual_platform_gate():
+            gate_period = gate_outputs[:, : self.config.gate_bins]
+            low_platform_norm = gate_outputs[:, self.config.gate_bins :]
+        else:
+            gate_period = gate_outputs
+            low_platform_norm = None
+        return GateReconstructionPredictions(
+            ts_norm=self.ts_out(ts_embedding),
+            x_norm=self.x_head(gate_inputs),
+            gate_period=gate_period,
+            low_platform_norm=low_platform_norm,
         )
+
+    def _uses_dual_platform_gate(self) -> bool:
+        return str(self.config.gate_representation).lower() == "dual_platform_gate"
+
+    def _gate_head_output_dim(self) -> int:
+        if self._uses_dual_platform_gate():
+            return self.config.gate_bins * 2
+        return self.config.gate_bins
 
 
 def _build_sinusoidal_encoding(length: int, hidden: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:

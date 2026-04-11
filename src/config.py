@@ -158,6 +158,8 @@ class ModelConfig:
     dropout: float = 0.1
     gate_bins: int = 128
     gate_representation: str = "single_gate"
+    x_decode_mode: str = "head"
+    x_mix_alpha: float = 0.5
 
 
 @dataclass

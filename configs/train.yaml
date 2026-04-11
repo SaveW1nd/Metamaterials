@@ -36,3 +36,5 @@ model:
   dropout: 0.1
   gate_bins: 128
   gate_representation: single_gate
+  x_decode_mode: head
+  x_mix_alpha: 0.5
