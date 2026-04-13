@@ -145,6 +145,7 @@ class ModelConfig:
     input_channels: int = 3
     stem_channels: int = 32
     hidden_channels: int = 128
+    tokenizer_variant: str = "default"
     ts_embedding_dim: int = 48
     patch_size: int = 16
     patch_stride: int = 16

@@ -8,12 +8,13 @@
 \usepackage{xcolor}
 \usepackage{booktabs}
 \usepackage{array}
+\usepackage{multirow}
+\usepackage{arydshln}
 \usepackage{url}
-\usepackage{tikz}
 
 \begin{document}
 
-\title{Gate-Reconstruction Learning for Metasurface-Inspired ISRJ Parameter Estimation}
+\title{Transformer-Based Parameter Estimation for Metasurface-Inspired ISRJ with Gate Reconstruction}
 
 \author{
 \IEEEauthorblockN{Author One, Author Two, Author Three}
@@ -27,58 +28,43 @@ email placeholder
 \maketitle
 
 \begin{abstract}
-Classical intermittent sampling repeater jamming (ISRJ) parameter estimation usually assumes ideal rectangular gating. That assumption becomes weak when the deceptive waveform keeps a finite low-scattering state instead of switching fully off. This paper addresses that case with a gate-reconstruction learning framework for estimating slice width, sampling interval, and low-state coefficient from raw IQ data. The model predicts the three parameters and reconstructs the periodic gate profile at the same time, so the estimation process stays tied to the waveform structure that produces the deceptive echo. The method reaches an overall accuracy of $83.61\%$, and its accuracy rises to $95.62\%$ when JNR is above $0$ dB. These findings suggest that reconstructing the gate profile helps the model estimate the three parameters more reliably, while low-JNR robustness remains the main weakness.
+Classical intermittent sampling repeater jamming (ISRJ) parameter estimation usually assumes ideal rectangular gating. This assumption is insufficient for metasurface-inspired ISRJ, where the signal may retain a finite low-scattering state instead of switching fully off. This paper studies the estimation of slice width, sampling interval, and the low-scattering coefficient directly from raw IQ observations. A Transformer-based estimator is used to capture the global periodic structure of the ISRJ signal. A one-period gate-reconstruction branch is added as an auxiliary structural constraint to help the model follow the modulation pattern. On the current synthetic benchmark, the proposed method reaches a total measurement accuracy of $83.61\%$, and the total measurement accuracy increases to $95.62\%$ when JNR is above $0$ dB. The results show that the proposed model is effective for this parameter-estimation task, while low-JNR robustness remains the main challenge.
 \end{abstract}
 
 \begin{IEEEkeywords}
-radar countermeasure, interrupted sampling, metasurface-inspired deception, parameter estimation, transformer network
+radar countermeasure, interrupted sampling, metasurface-inspired deception, parameter estimation, transformer
 \end{IEEEkeywords}
 
 \section{Introduction}
 Intermittent sampling repeater jamming (ISRJ) is an important form of coherent repeater jamming. The jammer intercepts the radar signal, samples it in short slices, and retransmits the samples after delay \cite{wang2007}. This sampling-and-retransmission process can generate multiple false targets while avoiding full-pulse storage \cite{feng2017}. The timing law is therefore central to both jamming analysis and countermeasure design. For this reason, classical ISRJ studies have focused mainly on slice width, sampling interval, and the resulting false-target structure \cite{wang2021admm,wei2018}.
 
-Deep learning has recently been introduced into radar jamming analysis and parameter inference. Wang \emph{et al.} \cite{wang2026ast} estimate ISRJ parameters through an end-to-end pipeline that combines separation and measurement. Lu \emph{et al.} \cite{lu2025rs} also couple recognition and parameter estimation in a detection-style framework. These studies show that data-driven models can reduce the dependence on handcrafted processing. However, they are still built around conventional ISRJ waveform assumptions.
+Deep learning has recently been introduced into radar jamming analysis and parameter inference. Wang \emph{et al.} \cite{wang2026ast} estimate ISRJ parameters through an end-to-end pipeline that combines separation and measurement. Lu \emph{et al.} \cite{lu2025rs} also couple recognition and parameter estimation in a detection-style framework. These studies show that data-driven models can reduce the dependence on handcrafted processing. However, they are still built around conventional ISRJ assumptions.
 
-In metasurface-inspired ISRJ, the returned waveform is governed by switching between high- and low-scattering states. Sun \emph{et al.} \cite{sun2024tmtt} describe how periodic switching between reflection states can manipulate radar echoes. Ding \emph{et al.} \cite{ding2025tmtt} further show that time-modulated metasurfaces can be used in radar jamming applications. Cai and Li \cite{cai2024} extend this picture by using simultaneous phase and amplitude coding to realize multi-frequency electromagnetic modulation, which supports a two-state view with a nonzero low-scattering level. Existing ISRJ parameter-estimation studies do not directly address this case, where the waveform departs from ideal rectangular gating but still retains periodic structure.
+In metasurface-inspired ISRJ, the returned signal is governed by switching between high- and low-scattering states. Sun \emph{et al.} \cite{sun2024tmtt} describe how time-modulated metasurfaces (TMMs) use periodic switching between reflection states to manipulate radar echoes. Ding \emph{et al.} \cite{ding2025tmtt} further show that TMMs can be used in radar jamming applications. Cai and Li \cite{cai2024} extend this picture by using simultaneous phase and amplitude coding to realize multi-frequency electromagnetic modulation, which supports a two-state view with a nonzero low-scattering level. Existing ISRJ parameter-estimation studies do not directly address this case, where the signal departs from ideal rectangular gating but still retains periodic structure.
 
-This paper studies parameter estimation for metasurface-inspired ISRJ with a normalized high-scattering state and a nonzero low-scattering state. The goal is to estimate slice width, sampling interval, and low-state coefficient from raw IQ observations. These parameters are all governed by the same periodic gate pattern. A direct three-output regressor does not enforce that structure explicitly. This paper therefore uses a reconstruction-guided estimator that predicts the three parameters while also recovering the gate profile. In this way, parameter estimation remains tied to the waveform structure that produces the jamming signal. Its main contributions are:
+This paper studies parameter estimation for metasurface-inspired ISRJ with a normalized high-scattering state and a nonzero low-scattering state. The goal is to estimate slice width, sampling interval, and the amplitude coefficient of the low-scattering state from raw IQ observations. These parameters are all governed by the same periodic gate pattern. A direct three-output regressor does not enforce that structure explicitly. This paper therefore uses a reconstruction-guided estimator that jointly estimates the three parameters while recovering the gate profile, thereby tying the estimation process to the waveform structure of the ISRJ signal. Its main contributions are:
 \begin{enumerate}
-\item A reconstruction-guided estimator that jointly predicts slice width, sampling interval, and low-state coefficient while recovering the underlying periodic modulation waveform.
-\item Strong results on the current benchmark, including high accuracy when JNR is above $0$ dB.
+\item A reconstruction-guided estimator that jointly estimates slice width, sampling interval, and the amplitude coefficient of the low-scattering state while recovering the underlying periodic modulation waveform.
+\item Strong results on the current benchmark, including high total measurement accuracy when JNR is above $0$ dB.
 \end{enumerate}
 
 The remainder of the paper defines the signal model, presents the proposed method, and reports the experimental results.
 
 \section{Signal Model and Problem Formulation}
-In this paper, metasurface-inspired ISRJ is described by periodic switching between a high-scattering state and a low-scattering state. This choice bridges the gap between idealized ISRJ gating and metasurface-inspired two-state modulation. A linear-frequency-modulated waveform is used as the base signal. The target delay and the deceptive delay are denoted by $\tau_t$ and $\tau_j$, respectively.
+In this paper, metasurface-inspired ISRJ is modeled as periodic switching between a high-scattering state and a low-scattering state. This formulation bridges idealized ISRJ gating and metasurface-inspired two-state modulation while remaining simple enough for parameter estimation. A linear-frequency-modulated waveform is used as the base signal, and the target delay and deceptive delay are denoted by $\tau_t$ and $\tau_j$, respectively.
 
-After normalizing the high-scattering state to one and denoting the low-state coefficient by $x_{\text{low}} \in [0, 0.5]$, the modulation waveform is written as
+After normalizing the high-scattering state to one and denoting the amplitude coefficient of the low-scattering state by $x_{\text{low}} \in [0, 0.5]$, the modulation waveform is written as
 \begin{equation}
 \begin{aligned}
 p(t)={}&\left(1-x_{\text{low}}\right)\operatorname{rect}\!\left(\frac{t-\tau_j}{T_l}\right) \otimes \\
 &\sum_{k=-\infty}^{+\infty}\delta\left(t-\tau_j-kT_s\right) + x_{\text{low}},
 \end{aligned}
 \end{equation}
-where $\operatorname{rect}(\cdot)$ denotes the rectangular pulse, $\otimes$ denotes convolution, $T_l$ is the slice width, and $T_s$ is the sampling interval. In this form, the effective scattering coefficient switches periodically between a normalized high-scattering state of $1$ and a low-scattering state of $x_{\text{low}}$.
+where $\operatorname{rect}(\cdot)$ denotes the rectangular pulse, $\otimes$ denotes convolution, $T_l$ is the slice width, and $T_s$ is the sampling interval. Under this model, the effective scattering coefficient switches periodically between a normalized high-scattering state of $1$ and a low-scattering state of $x_{\text{low}}$.
 
-\begin{figure}[t]
+\begin{figure}[!t]
 \centering
-\begin{tikzpicture}[x=0.85cm,y=1.5cm,>=stealth,thick]
-  \draw[->] (0,0) -- (7.2,0) node[right] {$t$};
-  \draw[->] (0,0) -- (0,1.35);
-  \node[left] at (0,1) {$1$};
-  \node[left] at (0,0.12) {$x$};
-  \draw[red,dashed] (0,1) -- (6.8,1);
-  \draw[blue] (0,0.12) -- (0.8,0.12) -- (0.8,1) -- (1.6,1) -- (1.6,0.12)
-              -- (3.0,0.12) -- (3.0,1) -- (3.8,1) -- (3.8,0.12)
-              -- (5.2,0.12) -- (5.2,1) -- (6.0,1) -- (6.0,0.12) -- (6.8,0.12);
-  \draw[<->] (0.05,0.93) -- (0.75,0.93);
-  \node[above] at (0.4,0.97) {$T_l$};
-  \draw[<->] (0.05,0.03) -- (1.55,0.03);
-  \node[below] at (0.8,0.01) {$T_s$};
-  \node[draw, fill=yellow!25, rounded corners, inner sep=2pt] at (2.7,1.16) {High-scattering state};
-  \node[draw, fill=yellow!25, rounded corners, inner sep=2pt] at (3.2,-0.18) {Low-scattering state};
-\end{tikzpicture}
+\includegraphics[width=0.95\columnwidth]{../plot/波形.pdf}
 \caption{Time modulation model with alternating high- and low-scattering states.}
 \label{fig:time_modulation_model}
 \end{figure}
@@ -95,48 +81,138 @@ where $n(t)$ is complex Gaussian noise. The parameter-estimation target is the v
 \begin{equation}
 \mathbf{y}=[T_l,\; T_s,\; x_{\text{low}}]^\top.
 \end{equation}
-For consistency with classical ISRJ terminology, the rest of the paper refers to $T_l$ as slice width and to $T_s$ as sampling interval.
 
-Two derived quantities help interpret estimation difficulty. The first is the duty ratio $\eta=T_l/T_s$, which gives the fraction of each period spent in the high-scattering state. The second is the timing gap $T_s-T_l$, which measures the separation between adjacent high-scattering segments. Together, they indicate when the waveform approaches a near-continuous retransmission regime. Both quantities reappear later in the confidence analysis because they mark physically meaningful hard operating regions.
+One derived quantity is used later in the decoder:
+\begin{equation}
+D=\frac{T_l}{T_s},
+\end{equation}
+which gives the fraction of each period spent in the high-scattering state.
 
 \section{Proposed Method}
-Given the target vector in Section III, the proposed method estimates slice width, sampling interval, and low-state coefficient directly from raw IQ observations. The main design choice is to reconstruct the periodic gate while predicting the three parameters. Gate reconstruction is not used here as a visualization byproduct. It keeps the estimator tied to the waveform structure that generates the target variables. This makes the method a better match to the signal model than unconstrained scalar regression.
+The proposed method estimates the slice width $T_l$, sampling interval $T_s$, and the amplitude coefficient of the low-scattering state $x_{\text{low}}$ directly from the received IQ signal. Rather than treating these three quantities as independent regression targets, the model predicts them through an intermediate gate-reconstruction pathway. This design follows the signal model in Section II: all three parameters are governed by the same periodic switching pattern. Reconstructing that pattern therefore provides a structural constraint that keeps the estimator consistent with the underlying jammer physics.
 
 \subsection{Input Representation}
-The estimator uses a two-channel IQ input so the representation stays close to the received waveform. The real and imaginary parts are normalized with a dataset-level scale and stacked as a $2 \times N$ tensor. This choice matches the currently trained \texttt{gate\_reconstruction} model and avoids adding handcrafted side features that are not used in the checked training recipe.
-
-\subsection{Gate-Reconstruction Estimator}
-The estimator follows a shared-encoder, coupled-decoder design. A one-dimensional convolutional tokenizer first extracts local waveform structure. A strided patch-embedding layer then converts the sequence into latent tokens. These tokens pass through a shared transformer encoder and are summarized into a compact global representation for downstream prediction. The shared encoder is used to preserve the periodic jammer pattern before the model commits to any single output branch.
-
-The encoded summary then feeds three coupled prediction paths:
-\begin{enumerate}
-\item a timing head that predicts normalized sampling interval,
-\item a coefficient head that predicts normalized low-state coefficient,
-\item a gate head that reconstructs a discretized periodic gate profile.
-\end{enumerate}
-
-The timing embedding is reused when decoding the low-state coefficient and gate profile, so the model does not treat the three targets as unrelated scalars. In practice, the network first learns a representation of periodic modulation. It then decodes the physical parameters from that shared structure. This is the main difference from a direct three-output regressor.
-
-\subsection{Training Objective and Physical Decoding}
-Let $\hat{\mathbf{y}}$ denote the decoded physical predictions, and let $\hat{\mathbf{g}}$ denote the reconstructed full-length jammer mask. The training objective combines weighted parameter regression, mask reconstruction, and temporal smoothing:
+The estimator uses a two-channel IQ input. Let $r[n] \in \mathbb{C}$ denote the sampled received signal. Its real and imaginary parts are stacked as
 \begin{equation}
-\mathcal{L}=\mathcal{L}_{\text{reg}} + \lambda_r \mathcal{L}_{\text{mask}} + \lambda_{tv} \mathcal{L}_{tv},
+\mathbf{X}=
+\begin{bmatrix}
+\Re\{r[0]\} & \cdots & \Re\{r[N-1]\}\\
+\Im\{r[0]\} & \cdots & \Im\{r[N-1]\}
+\end{bmatrix}
+\in \mathbb{R}^{2 \times N}.
 \end{equation}
-where $\mathcal{L}_{\text{reg}}$ is a weighted smooth-$L_1$ loss over $T_l$, $T_s$, and $x_{\text{low}}$, $\mathcal{L}_{\text{mask}}$ compares the reconstructed and true jammer masks, and $\mathcal{L}_{tv}$ penalizes excessive variation across adjacent bins of the decoded gate period. In the checked configuration, the parameter loss weights emphasize slice-width error most strongly, followed by low-state-coefficient error and then sampling-interval error. This weighting comes directly from the checked training recipe.
 
-After training, normalized outputs are mapped back to physical units using the same scaler ranges that define the synthetic dataset. The decoder also enforces the dataset's minimum interval-gap constraint, so predicted timing values remain inside a physically meaningful region. The final output is still the physical parameter tuple of Section III, but it is obtained through an intermediate representation that resembles a realizable periodic gate profile.
+\subsection{Encoder}
+Figure~\ref{fig:proposed_architecture} shows the proposed estimator in two parts: Fig.~\ref{fig:proposed_architecture}(a) illustrates the encoder, and Fig.~\ref{fig:proposed_architecture}(b) illustrates the decoder. The encoder begins with a convolutional tokenizer, implemented as a shallow temporal convolutional front-end followed by a strided patch-embedding layer, which converts the received IQ sequence into latent patch representations. A learnable global embedding is concatenated with the patch sequence, positional encoding is added, and the resulting sequence is processed by a transformer encoder.
 
-\subsection{Auxiliary Confidence Analysis}
-In addition to point estimation, the repository defines a lightweight confidence score derived from physically meaningful margins: duty ratio, low-state-coefficient risk, timing-gap margin, and boundary margin. These terms are combined into a scalar risk score and converted into a confidence score in $[0,1]$. This module is not a second primary contribution. It serves as an auxiliary analysis tool to test whether the estimator can flag geometrically difficult operating points in addition to returning parameter predictions.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.95\textwidth]{../plot/model.pdf}
+\caption{Architecture of the proposed gate-reconstruction estimator. (a) The encoder converts the input IQ sequence into token representations by combining patch embedding, a learnable global embedding, positional encoding, and transformer encoding. (b) The decoder splits the token representations, aggregates them into a shared summary, and predicts the sampling interval $T_s$, the amplitude coefficient $x$ of the low-scattering state, and the duty ratio $D$.}
+\label{fig:proposed_architecture}
+\end{figure*}
+
+The output sequence is then separated into a global embedding and patch-level contextualized representations. The patch sequence is summarized by mean pooling, max pooling, and standard-deviation pooling across the sequence dimension. These three pooled vectors are concatenated with the global embedding to form a shared summary vector,
+\begin{equation}
+\mathbf{h}_{\text{sum}}=
+\left[
+\mathbf{h}_{\text{g}};
+\operatorname{Mean}(\mathbf{H});
+\operatorname{Max}(\mathbf{H});
+\operatorname{Std}(\mathbf{H})
+\right],
+\end{equation}
+where $\mathbf{h}_{\text{g}}$ denotes the global embedding and $\mathbf{H}$ denotes the matrix of patch-level contextualized representations. This summary vector serves as the common feature source for all downstream predictions.
+
+\subsection{Decoder}
+As shown in Fig.~\ref{fig:proposed_architecture}(b), the decoder first splits the encoder output and aggregates it into the shared summary $\mathbf{h}_{\text{sum}}$. The first decoder branch maps $\mathbf{h}_{\text{sum}}$ to a timing representation through a multilayer perceptron and then predicts the sampling interval $\hat{T}_s$. The resulting timing representation is concatenated back with the shared summary so that the remaining branches are conditioned on the estimated timing context.
+
+The second branch predicts the amplitude coefficient of the low-scattering state $\hat{x}_{\text{low}}$. The third branch predicts a discretized gate profile over one switching period,
+\begin{equation}
+\hat{\mathbf{g}}=
+[\hat{g}_1,\hat{g}_2,\ldots,\hat{g}_K]^\top,
+\end{equation}
+where $K$ is the number of gate bins. Each element represents the predicted scattering level at one normalized position within the switching period. This profile induces a soft duty ratio,
+\begin{equation}
+\hat{D}=\frac{1}{K}\sum_{k=1}^{K}\hat{g}_k,
+\end{equation}
+from which the slice width is recovered jointly with the predicted sampling interval as
+\begin{equation}
+\hat{T}_l=\hat{D}\,\hat{T}_s.
+\end{equation}
+The decoded one-period profile is then mapped back to the full time axis to form the jammer mask
+\begin{equation}
+\hat{\mathbf m}=[\hat{m}_1,\hat{m}_2,\ldots,\hat{m}_L]^\top,
+\end{equation}
+where each $\hat{m}_n$ is obtained by repeating the one-period profile according to the predicted interval $\hat{T}_s$ and combining it with the predicted amplitude coefficient of the low-scattering state $\hat{x}_{\text{low}}$. The predicted timing parameters are clipped to satisfy the dataset constraints, particularly the minimum separation between adjacent high-scattering segments. This step ensures that the decoded gate remains physically realizable.
+
+\subsection{Model Optimization}
+Let $\hat{\mathbf{y}}=[\hat{T}_l,\hat{T}_s,\hat{x}_{\text{low}}]^\top$ denote the decoded physical predictions, and let $\hat{\mathbf{m}}$ denote the reconstructed full-length jammer mask. The training objective combines parameter regression, mask reconstruction, and total-variation (TV) regularization:
+\begin{equation}
+\mathcal{L}=\mathcal{L}_{\text{reg}} + \lambda_{\text{mask}} \mathcal{L}_{\text{mask}} + \lambda_{tv} \mathcal{L}_{tv},
+\end{equation}
+where the parameter regression term is
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{\text{reg}}=\;&w_l\,\ell_{\mathrm{SL1}}(\hat{T}_l,T_l) \\
+&+ w_s\,\ell_{\mathrm{SL1}}(\hat{T}_s,T_s)
++ w_x\,\ell_{\mathrm{SL1}}(\hat{x}_{\text{low}},x_{\text{low}}),
+\end{aligned}
+\end{equation}
+the mask-reconstruction term is
+\begin{equation}
+\mathcal{L}_{\text{mask}}
+=
+\ell_{\mathrm{SL1}}(\hat{\mathbf{m}},\mathbf{m}),
+\end{equation}
+and the TV regularizer on the predicted one-period gate profile is
+\begin{equation}
+\mathcal{L}_{tv}
+=
+\frac{1}{K-1}
+\sum_{k=1}^{K-1}
+\left|\hat{g}_{k+1}-\hat{g}_{k}\right|.
+\end{equation}
+Here, $\ell_{\mathrm{SL1}}(\cdot,\cdot)$ denotes the smooth-$L_1$ loss,
+\begin{equation}
+\begin{aligned}
+\ell_{\mathrm{SL1}}(a,b)
+=
+\begin{cases}
+\frac{1}{2}(a-b)^2, & |a-b|<1,\\
+|a-b|-\frac{1}{2}, & |a-b|\ge 1,
+\end{cases}
+\end{aligned}
+\end{equation}
+The regression term supervises the final physical parameters, the mask term aligns the reconstructed waveform-level modulation with the ground-truth jammer mask, and the TV term suppresses unrealistic bin-to-bin oscillations in the predicted period profile.
 
 \section{Experimental Results}
 \subsection{Experimental Setup}
-The experiments test whether the proposed estimator can recover the parameter tuple of Section III in the synthetic single-component setting used in this paper. The checked dataset configuration exports $6200$ training samples, $775$ validation samples, and $775$ held-out test samples. The JNR sweep is discrete and balanced across integer values from $-10$ dB to $20$ dB. Duty-cycle coverage is stabilized through four bins, so the model is not trained on a narrow subset of timing regimes.
+\subsubsection{Dataset Settings}
+The dataset is generated according to the signal model in Section II. The ranges of $T_l$, $T_s$, $x$, and JNR are listed in Table~\ref{tab:data_ranges}, while the SNR is fixed at $0$ dB. For each sample, the signal parameters are randomly drawn from these ranges to generate different metasurface-inspired ISRJ signals. The resulting dataset contains 6200 training samples, 775 validation samples, and 775 test samples.
 
-The checked training configuration uses batch size $16$, learning rate $3\times 10^{-4}$, weight decay $10^{-4}$, and $64$ end-to-end epochs. The selected architecture uses two input channels, hidden width $128$, four shared transformer layers, and a gate decoder with $128$ bins. Unless otherwise stated, all quantitative results are reported on the held-out test split of this configuration.
+\begin{table}[!t]
+\centering
+\caption{Parameter ranges used in data generation.}
+\label{tab:data_ranges}
+\begin{tabular}{cc}
+\toprule
+Symbol & Range \\
+\midrule
+$T_l$ & $0.4\!\sim\!4.0~\mu\text{s}$ \\
+$T_s$ & $1.0\!\sim\!10.0~\mu\text{s}$ \\
+$x$ & $0.0\!\sim\!0.5$ \\
+SNR & $0$ dB \\
+JNR & $-10\!\sim\!20$ dB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Training Settings}
+The network is optimized with a learning rate of $3\times 10^{-4}$ and a weight decay of $10^{-4}$.
 
 \subsection{Evaluation Metrics}
-Both mean absolute error (MAE) and accuracy are reported so that the evaluation reflects both average deviation and operational tolerances. Let $N_{\text{test}}$ denote the number of test samples. Let $\hat{T}_{l,i}$, $\hat{T}_{s,i}$, and $\hat{x}_{\text{low},i}$ denote the predicted parameters of sample $i$, and let $T_{l,i}$, $T_{s,i}$, and $x_{\text{low},i}$ denote the corresponding ground-truth values. The three per-parameter accuracy metrics are defined as
+Both mean absolute error (MAE) and measurement accuracy are reported so that the evaluation reflects both average deviation and operational tolerances. Let $N_{\text{test}}$ denote the number of test samples. Let $\hat{T}_{l,i}$, $\hat{T}_{s,i}$, and $\hat{x}_{\text{low},i}$ denote the predicted parameters of sample $i$, and let $T_{l,i}$, $T_{s,i}$, and $x_{\text{low},i}$ denote the corresponding ground-truth values. The three per-parameter measurement accuracy metrics are defined as
 \begin{equation}
 A_{T_l}=\frac{1}{N_{\text{test}}}\sum_{i=1}^{N_{\text{test}}}\mathbb{I}\!\left(\left|\hat{T}_{l,i}-T_{l,i}\right|\le 0.15~\mu\text{s}\right)\times 100\%,
 \end{equation}
@@ -146,82 +222,78 @@ A_{T_s}=\frac{1}{N_{\text{test}}}\sum_{i=1}^{N_{\text{test}}}\mathbb{I}\!\left(\
 \begin{equation}
 A_{x}=\frac{1}{N_{\text{test}}}\sum_{i=1}^{N_{\text{test}}}\mathbb{I}\!\left(\left|\hat{x}_{\text{low},i}-x_{\text{low},i}\right|\le 0.05\right)\times 100\%,
 \end{equation}
-where $\mathbb{I}(\cdot)$ is the indicator function. For compactness, let $\mathcal{E}_i$ denote the event that all three parameter errors of sample $i$ satisfy their respective tolerances. Total accuracy is then defined as
+where $\mathbb{I}(\cdot)$ is the indicator function. Let $\mathcal{E}_i$ denote the event that all three parameter errors of sample $i$ satisfy their respective tolerances. The total measurement accuracy is then defined as
 \begin{equation}
 A_{\text{total}}=\frac{1}{N_{\text{test}}}\sum_{i=1}^{N_{\text{test}}}\mathbb{I}(\mathcal{E}_i)\times 100\%.
 \end{equation}
 
-\subsection{Main Results}
-The first experiment tests whether the gate-reconstruction estimator can recover all three target parameters on the held-out test split. Table~\ref{tab:overall_results} shows that the answer is yes in most cases. The model reaches an $83.61\%$ total accuracy, which means all three parameters fall within their prescribed tolerances for the majority of test samples.
+\subsection{Overall Results}
+Table~\ref{tab:overall_results} summarizes the test results over the five runs. The proposed method reaches a total measurement accuracy of $83.85\%\pm1.10\%$, indicating that all three parameters satisfy their prescribed tolerances for most test samples.
 
-The per-parameter results show a clear pattern. Slice width and sampling interval are easier to recover, with mean absolute errors of $0.0573~\mu$s and $0.0994~\mu$s and accuracies above $94\%$. The low-state coefficient is harder, with a mean absolute error of $0.0270$ and an accuracy of $87.48\%$. This gap is reasonable. Periodic timing structure is reflected more directly in the received waveform, while the low-state coefficient is more sensitive to noise and local gate-reconstruction error. Overall, the main weakness of the current model is coefficient-level estimation, not timing recovery.
+For comparison, a 1D residual convolutional baseline was used. It uses global average pooling and a three-parameter regression head. This baseline was trained with the same IQ input and the same optimization settings as the proposed method. As shown in Table~\ref{tab:overall_results}, it reaches a total measurement accuracy of $50.97\%\pm3.13\%$, which is far below the $83.85\%\pm1.10\%$ achieved by the proposed method. The gap is even larger in the low-JNR regime, where it obtains only $22.48\%\pm2.20\%$ total measurement accuracy. These results show a clear advantage of the proposed framework over a direct convolutional baseline.
 
-The same conclusion remains stable across random initializations. Over five independent training runs, the mean total accuracy is $81.63\%$ with a standard deviation of $1.38$ percentage points. The corresponding low-JNR total accuracy is $53.20\%$ with a standard deviation of $2.30$ percentage points. These numbers show that the method does not depend on a single favorable seed. Instead, it produces a relatively narrow performance band across runs. This supports the reproducibility of the current training setup.
+Looking at the individual parameters, the results show a clear pattern. Slice width and sampling interval are easier to recover, with measurement accuracy of $93.52\%\pm0.39\%$ and $95.79\%\pm0.68\%$, respectively, while the amplitude coefficient of the low-scattering state remains harder, with a measurement accuracy of $87.72\%\pm0.98\%$. The same trend appears in the mean absolute errors: both $T_l$ and $T_s$ remain below $0.1~\mu$s on average, whereas the amplitude coefficient of the low-scattering state remains the dominant residual error source.
 
-\begin{table}[t]
+\begin{table}[!t]
 \centering
-\caption{Overall parameter recovery results on the held-out test split. Total accuracy requires all three parameters to satisfy their respective tolerances.}
+\caption{Overall parameter recovery results.}
 \label{tab:overall_results}
-\begin{tabular}{lcc}
+\begin{tabular}{cccc}
 \toprule
-Parameter & MAE & Accuracy (\%) \\
+Method & Parameter & MAE & Measurement Accuracy (\%) \\
 \midrule
-Slice width ($\mu$s) & 0.0573 & 94.45 \\
-Sampling interval ($\mu$s) & 0.0994 & 96.52 \\
-Low-state coefficient & 0.0270 & 87.48 \\
-Total & -- & 83.61 \\
+\multirow{4}{*}{Proposed} & $T_l$ & $0.0588 \pm 0.0020$ & $93.52 \pm 0.39$ \\
+ & $T_s$ & $0.0995 \pm 0.0066$ & $95.79 \pm 0.68$ \\
+ & $x_{\text{low}}$ & $0.0265 \pm 0.0014$ & $87.72 \pm 0.98$ \\
+ & Total & -- & $83.85 \pm 1.10$ \\
+\noalign{\vskip 0.35ex}
+\cdashline{1-4}
+\noalign{\vskip 0.35ex}
+\multirow{4}{*}{ResNet} & $T_l$ & $0.1084 \pm 0.0029$ & $81.55 \pm 1.79$ \\
+ & $T_s$ & $0.2308 \pm 0.0083$ & $73.24 \pm 1.15$ \\
+ & $x_{\text{low}}$ & $0.0412 \pm 0.0033$ & $70.12 \pm 4.51$ \\
+ & Total & -- & $50.97 \pm 3.13$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Robustness Across JNR Regimes}
-To locate the remaining errors, performance is further broken down by JNR regime. Table~\ref{tab:jnr_slices} shows that most of the degradation is concentrated in the lowest-JNR range. In $[-10,0)$~dB, total accuracy drops to $58.40\%$. It then rises quickly to $90.67\%$, $96.67\%$, and $98.22\%$ in the $[0,6)$, $[6,12)$, and $[12,20]$~dB ranges, respectively.
+\subsection{Results Across JNR Conditions}
+Fig.~\ref{fig:jnr_curves} shows the parameter measurement accuracy under different JNR conditions. All four curves improve as JNR increases, and the strongest degradation is concentrated in the amplitude coefficient of the low-scattering state and in the total measurement accuracy.
 
-This result matters because it clarifies what is limiting the model. The method already recovers the interrupted-sampling structure reliably in moderate and high JNR conditions. The overall error budget is instead dominated by a relatively small set of hard low-JNR cases. A finer-grained inspection of the pointwise JNR slices shows the same pattern: at $-10$~dB, total accuracy falls to $8\%$. At that point, both gate shape and low-state coefficient become difficult to infer because the jammer signature is strongly masked by noise. The main future target is therefore low-JNR robustness, not a redesign of the overall modeling framework.
+This behavior is consistent with the signal model. The timing parameters $T_l$ and $T_s$ mainly determine the periodic structure of the gate, so they are supported by global cues such as repetition pattern and edge location across the waveform. By contrast, $x$ mainly controls the amplitude contrast between the high and low states through $p(t)=x+(1-x)g(t)$, which provides weaker structural evidence. In addition, the information about $x$ is concentrated mainly in the low-state segments, while the high-state segments are normalized to unity and therefore contribute less to its identification. As a result, the estimation of $x$ is more sensitive to noise contamination, which explains why its measurement accuracy degrades more severely in the low-JNR regime.
 
-\begin{table}[t]
+Table~\ref{tab:jnr_slices} further summarizes the low-, mid-, and high-JNR ranges. In the low-JNR range $[-10,0)$~dB, the total measurement accuracy drops to $57.12\%\pm2.49\%$, and the measurement accuracy of the amplitude coefficient of the low-scattering state falls to $67.60\%\pm2.10\%$. In contrast, the model is already close to saturation in the medium- and high-JNR ranges, where both timing parameters exceed $99\%$ measurement accuracy on average.
+
+\begin{table}[!t]
 \centering
-\caption{Parameter recovery across JNR regimes on the test split. The main degradation is concentrated in the lowest-JNR range.}
+\caption{Parameter measurement accuracy in the low-, mid-, and high-JNR ranges.}
 \label{tab:jnr_slices}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{lcccc}
+\begin{tabular}{ccccc}
 \toprule
-JNR range (dB) & Count & Slice-width MAE & Sampling-interval MAE & Total accuracy (\%) \\
+JNR range (dB) & $A_{T_l}$ (\%) & $A_{T_s}$ (\%) & $A_x$ (\%) & $A_{\text{total}}$ (\%) \\
 \midrule
-$[-10,0)$ & 250 & 0.1113 & 0.1968 & 58.40\% \\
-$[0,6)$   & 150 & 0.0327 & 0.0569 & 90.67\% \\
-$[6,12)$  & 150 & 0.0284 & 0.0502 & 96.67\% \\
-$[12,20]$ & 225 & 0.0329 & 0.0524 & 98.22\% \\
+$[-10,0)$ & $81.44 \pm 0.88$ & $87.20 \pm 2.08$ & $67.60 \pm 2.10$ & $57.12 \pm 2.49$ \\
+$[0,10)$  & $99.20 \pm 0.40$ & $99.76 \pm 0.22$ & $95.60 \pm 1.62$ & $94.80 \pm 1.62$ \\
+$[10,20]$ & $99.35 \pm 0.70$ & $100.00 \pm 0.00$ & $98.84 \pm 0.75$ & $98.18 \pm 1.23$ \\
 \bottomrule
 \end{tabular}
 }
 \end{table}
 
-\begin{table}[t]
+\begin{figure}[!t]
 \centering
-\caption{Reproducibility across five random seeds. Results are reported as mean, standard deviation, minimum, and maximum.}
-\label{tab:stability}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lcccc}
-\toprule
-Metric & Mean & Std & Min & Max \\
-\midrule
-Total accuracy (\%) & 81.63 & 1.38 & 79.48 & 82.97 \\
-Low-JNR total accuracy (\%) & 53.20 & 2.30 & 51.20 & 56.80 \\
-Slice-width accuracy (\%) & 92.70 & 0.89 & 91.35 & 93.55 \\
-Sampling-interval accuracy (\%) & 95.17 & 0.64 & 94.45 & 96.00 \\
-Low-state-coefficient accuracy (\%) & 86.55 & 1.30 & 84.52 & 87.87 \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
+\includegraphics[width=0.95\columnwidth]{../plot/JNR.pdf}
+\caption{Parameter measurement accuracy under different JNR conditions.}
+\label{fig:jnr_curves}
+\end{figure}
 
 \section{Conclusion}
-This paper presented a gate-reconstruction learning framework for parameter estimation under a metasurface-inspired interrupted-sampling deception model with a nonzero low-state coefficient. The main idea is to couple parameter decoding with periodic gate recovery instead of treating the task as three independent scalar regressions.
+This paper presented a gate-reconstruction learning framework for parameter estimation under a metasurface-inspired interrupted-sampling deception model with a nonzero amplitude coefficient of the low-scattering state. The main idea is to couple parameter decoding with periodic gate recovery instead of treating the task as three independent scalar regressions.
 
-On the current synthetic benchmark, the method reaches an $83.61\%$ total accuracy on the held-out test split. Performance is already near-saturated in moderate- and high-JNR regimes. The results also remain stable across random initializations. The main unresolved weakness is robustness in extremely low JNR conditions.
+On the synthetic benchmark used in this paper, the method reaches a mean total measurement accuracy of $83.85\%\pm1.10\%$ on the test split over five independent runs. Performance is already near-saturated in moderate- and high-JNR regimes, while robustness in extremely low JNR conditions remains the main unresolved weakness.
 
-These findings support the central claim of the paper: under the considered two-state ISRJ model, reconstructing the gate profile helps the model estimate slice width, sampling interval, and low-state coefficient more reliably. The present study is limited to a simulation-based single-component setting with a narrow jammer family and one heuristic baseline. The claims should therefore be read within that scope. Future work should strengthen low-JNR robustness, extend the benchmark to broader jammer families, and validate the framework beyond the current single-component synthetic setting.
+These findings support the central claim of the paper: under the considered two-state ISRJ model, reconstructing the gate profile helps the model estimate slice width, sampling interval, and the amplitude coefficient of the low-scattering state more reliably. The present study is limited to a simulation-based single-component setting with a narrow jammer family and one heuristic baseline. The claims should therefore be read within that scope. Future work should strengthen low-JNR robustness, extend the benchmark to broader jammer families, and validate the framework beyond the current single-component synthetic setting.
 
 
 \section*{Acknowledgment}

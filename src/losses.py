@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from config import ParameterScaler
-from model import GateReconstructionPredictions, TwoStagePredictions
+from model import DirectRegressionPredictions, GateReconstructionPredictions, TwoStagePredictions
 
 
 @dataclass
@@ -46,7 +46,7 @@ class DecodedPredictions:
 
 
 def compute_parameter_loss(
-    predictions_raw: TwoStagePredictions | GateReconstructionPredictions,
+    predictions_raw: TwoStagePredictions | GateReconstructionPredictions | DirectRegressionPredictions,
     targets: torch.Tensor,
     jammer_iq: torch.Tensor,
     *,
@@ -69,6 +69,13 @@ def compute_parameter_loss(
     x_decode_mode: str = "head",
     x_mix_alpha: float = 0.5,
 ) -> LossOutput:
+    if isinstance(predictions_raw, DirectRegressionPredictions):
+        return _compute_direct_regression_loss(
+            predictions_raw=predictions_raw,
+            targets=targets,
+            scaler=scaler,
+            parameter_loss_weights=parameter_loss_weights,
+        )
     if isinstance(predictions_raw, GateReconstructionPredictions):
         return _compute_gate_reconstruction_loss(
             predictions_raw=predictions_raw,
@@ -105,7 +112,7 @@ def compute_parameter_loss(
 
 
 def decode_predictions(
-    predictions_raw: TwoStagePredictions | GateReconstructionPredictions,
+    predictions_raw: TwoStagePredictions | GateReconstructionPredictions | DirectRegressionPredictions,
     scaler: ParameterScaler,
     min_timing_gap_us: float,
     parameterization: str = "duty",
@@ -115,6 +122,11 @@ def decode_predictions(
     x_decode_mode: str = "head",
     x_mix_alpha: float = 0.5,
 ) -> DecodedPredictions:
+    if isinstance(predictions_raw, DirectRegressionPredictions):
+        return _decode_direct_regression_predictions(
+            predictions_raw=predictions_raw,
+            scaler=scaler,
+        )
     if isinstance(predictions_raw, GateReconstructionPredictions):
         return _decode_gate_predictions(
             predictions_raw=predictions_raw,
@@ -135,7 +147,7 @@ def decode_predictions(
 
 
 def compute_metrics(
-    predictions_raw: TwoStagePredictions | GateReconstructionPredictions,
+    predictions_raw: TwoStagePredictions | GateReconstructionPredictions | DirectRegressionPredictions,
     targets: torch.Tensor,
     scaler: ParameterScaler,
     min_timing_gap_us: float,
@@ -162,6 +174,21 @@ def compute_metrics(
         "sampling_interval_rmse_us": float(rmse[1].item()),
         "modulation_floor_rmse": float(rmse[2].item()),
     }
+
+
+def _compute_direct_regression_loss(
+    predictions_raw: DirectRegressionPredictions,
+    targets: torch.Tensor,
+    scaler: ParameterScaler,
+    parameter_loss_weights: tuple[float, float, float],
+) -> LossOutput:
+    decoded = _decode_direct_regression_predictions(predictions_raw, scaler)
+    physical_predictions = decoded.as_physical_tensor()
+    weights = torch.tensor(parameter_loss_weights, dtype=targets.dtype, device=targets.device).view(1, 3)
+    regression_terms = F.smooth_l1_loss(physical_predictions, targets, reduction="none") * weights
+    regression = regression_terms.mean()
+    zero = regression.new_tensor(0.0)
+    return LossOutput(total=regression, regression=regression, ordering=zero, consistency=zero)
 
 
 def build_target_components(
@@ -406,6 +433,22 @@ def _decode_two_stage_predictions(
         slice_width_us=slice_width_us,
         sampling_interval_us=sampling_interval_us,
         modulation_floor=modulation_floor,
+    )
+
+
+def _decode_direct_regression_predictions(
+    predictions_raw: DirectRegressionPredictions,
+    scaler: ParameterScaler,
+) -> DecodedPredictions:
+    normalized = predictions_raw.normalized_params.clamp(0.0, 1.0)
+    physical = scaler.denormalize_tensor(normalized)
+    return DecodedPredictions(
+        ts_norm=normalized[:, 1:2],
+        timing_param=normalized[:, 0:1],
+        x_norm=normalized[:, 2:3],
+        slice_width_us=physical[:, 0:1],
+        sampling_interval_us=physical[:, 1:2],
+        modulation_floor=physical[:, 2:3],
     )
 
 

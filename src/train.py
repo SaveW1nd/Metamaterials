@@ -327,7 +327,7 @@ def _run_epoch(
 
 
 def _build_training_stages(config: TrainingConfig) -> list[dict[str, int | str]]:
-    if str(config.model.architecture).lower() == "gate_reconstruction":
+    if str(config.model.architecture).lower() in {"gate_reconstruction", "resnet_regression"}:
         return [{"name": "end_to_end", "epochs": int(config.end_to_end_epochs)}]
     stages = [
         {"name": "ts_only", "epochs": config.ts_only_epochs},

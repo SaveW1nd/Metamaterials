@@ -34,6 +34,14 @@ class GateReconstructionPredictions:
         return torch.cat(tensors, dim=1)
 
 
+@dataclass
+class DirectRegressionPredictions:
+    normalized_params: torch.Tensor
+
+    def as_tensor(self) -> torch.Tensor:
+        return self.normalized_params
+
+
 class ConvPatchTokenizer(nn.Module):
     def __init__(
         self,
@@ -42,17 +50,25 @@ class ConvPatchTokenizer(nn.Module):
         hidden_channels: int,
         patch_size: int,
         patch_stride: int,
+        variant: str = "default",
     ):
         super().__init__()
-        self.frontend = nn.Sequential(
-            nn.Conv1d(in_channels, stem_channels, kernel_size=7, padding=3),
-            nn.BatchNorm1d(stem_channels),
-            nn.GELU(),
-            nn.Conv1d(stem_channels, stem_channels, kernel_size=5, padding=2, groups=stem_channels),
-            nn.Conv1d(stem_channels, stem_channels, kernel_size=1),
-            nn.BatchNorm1d(stem_channels),
-            nn.GELU(),
-        )
+        self.variant = str(variant).lower()
+        if self.variant == "simple":
+            self.frontend = nn.Sequential(
+                nn.Conv1d(in_channels, stem_channels, kernel_size=7, padding=3),
+                nn.GELU(),
+            )
+        else:
+            self.frontend = nn.Sequential(
+                nn.Conv1d(in_channels, stem_channels, kernel_size=7, padding=3),
+                nn.BatchNorm1d(stem_channels),
+                nn.GELU(),
+                nn.Conv1d(stem_channels, stem_channels, kernel_size=5, padding=2, groups=stem_channels),
+                nn.Conv1d(stem_channels, stem_channels, kernel_size=1),
+                nn.BatchNorm1d(stem_channels),
+                nn.GELU(),
+            )
         self.patch_embed = nn.Conv1d(
             stem_channels,
             hidden_channels,
@@ -122,6 +138,29 @@ class TokenAttentionPooling(nn.Module):
         return torch.sum(tokens * weights, dim=1)
 
 
+class ResidualBlock1D(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.activation = nn.GELU()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.shortcut(x)
+        out = self.activation(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.activation(out + identity)
+
+
 class PGIQNet(nn.Module):
     def __init__(self, config: ModelConfig | None = None):
         super().__init__()
@@ -134,6 +173,7 @@ class PGIQNet(nn.Module):
             hidden_channels=self.config.hidden_channels,
             patch_size=self.config.patch_size,
             patch_stride=self.config.patch_stride,
+            variant=self.config.tokenizer_variant,
         )
         self.shared_encoder = TransformerStage(
             hidden_channels=self.config.hidden_channels,
@@ -251,6 +291,48 @@ class PGIQNet(nn.Module):
         return self.config.hidden_channels * 4
 
 
+class ResNetRegressionNet(nn.Module):
+    def __init__(self, config: ModelConfig | None = None):
+        super().__init__()
+        self.config = config or ModelConfig(architecture="resnet_regression", input_channels=2)
+        stage2_channels = max(self.config.stem_channels * 2, self.config.hidden_channels // 2)
+        stage3_channels = max(stage2_channels * 2, self.config.hidden_channels)
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(self.config.input_channels, self.config.stem_channels, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm1d(self.config.stem_channels),
+            nn.GELU(),
+        )
+        self.stage1 = nn.Sequential(
+            ResidualBlock1D(self.config.stem_channels, self.config.stem_channels),
+            ResidualBlock1D(self.config.stem_channels, self.config.stem_channels),
+        )
+        self.stage2 = nn.Sequential(
+            ResidualBlock1D(self.config.stem_channels, stage2_channels, stride=2),
+            ResidualBlock1D(stage2_channels, stage2_channels),
+        )
+        self.stage3 = nn.Sequential(
+            ResidualBlock1D(stage2_channels, stage3_channels, stride=2),
+            ResidualBlock1D(stage3_channels, stage3_channels),
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Sequential(
+            nn.Linear(stage3_channels, self.config.hidden_channels),
+            nn.GELU(),
+            nn.Dropout(self.config.dropout),
+            nn.Linear(self.config.hidden_channels, 3),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, iq: torch.Tensor) -> DirectRegressionPredictions:
+        x = self.stem(iq)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.pool(x).squeeze(-1)
+        return DirectRegressionPredictions(normalized_params=self.head(x))
+
+
 class GateReconstructionNet(nn.Module):
     def __init__(self, config: ModelConfig | None = None):
         super().__init__()
@@ -263,6 +345,7 @@ class GateReconstructionNet(nn.Module):
             hidden_channels=self.config.hidden_channels,
             patch_size=self.config.patch_size,
             patch_stride=self.config.patch_stride,
+            variant=self.config.tokenizer_variant,
         )
         self.shared_encoder = TransformerStage(
             hidden_channels=self.config.hidden_channels,
@@ -352,4 +435,6 @@ def build_model(config: ModelConfig | None = None) -> nn.Module:
         return PGIQNet(resolved)
     if architecture == "gate_reconstruction":
         return GateReconstructionNet(resolved)
+    if architecture == "resnet_regression":
+        return ResNetRegressionNet(resolved)
     raise ValueError(f"Unsupported architecture '{resolved.architecture}'.")
