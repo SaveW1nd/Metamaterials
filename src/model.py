@@ -161,6 +161,72 @@ class ResidualBlock1D(nn.Module):
         return self.activation(out + identity)
 
 
+class TemporalBlock1D(nn.Module):
+    def __init__(self, channels: int, dilation: int, dropout: float):
+        super().__init__()
+        self.conv1 = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.conv2 = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+            bias=False,
+        )
+        self.bn2 = nn.BatchNorm1d(channels)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = self.activation(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.conv2(out))
+        out = self.dropout(out)
+        return self.activation(out + identity)
+
+
+class DenseLayer1D(nn.Module):
+    def __init__(self, in_channels: int, growth_rate: int, bn_size: int = 4, dropout: float = 0.0):
+        super().__init__()
+        inter_channels = bn_size * growth_rate
+        self.norm1 = nn.BatchNorm1d(in_channels)
+        self.act1 = nn.GELU()
+        self.conv1 = nn.Conv1d(in_channels, inter_channels, kernel_size=1, bias=False)
+        self.norm2 = nn.BatchNorm1d(inter_channels)
+        self.act2 = nn.GELU()
+        self.conv2 = nn.Conv1d(inter_channels, growth_rate, kernel_size=3, padding=1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        new_features = self.conv1(self.act1(self.norm1(x)))
+        new_features = self.conv2(self.act2(self.norm2(new_features)))
+        new_features = self.dropout(new_features)
+        return torch.cat([x, new_features], dim=1)
+
+
+class Transition1D(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.BatchNorm1d(in_channels),
+            nn.GELU(),
+            nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.AvgPool1d(kernel_size=2, stride=2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
+
 class PGIQNet(nn.Module):
     def __init__(self, config: ModelConfig | None = None):
         super().__init__()
@@ -295,29 +361,35 @@ class ResNetRegressionNet(nn.Module):
     def __init__(self, config: ModelConfig | None = None):
         super().__init__()
         self.config = config or ModelConfig(architecture="resnet_regression", input_channels=2)
-        stage2_channels = max(self.config.stem_channels * 2, self.config.hidden_channels // 2)
-        stage3_channels = max(stage2_channels * 2, self.config.hidden_channels)
+        base_channels = max(64, self.config.stem_channels)
+        stage2_channels = base_channels * 2
+        stage3_channels = base_channels * 4
+        stage4_channels = base_channels * 8
 
         self.stem = nn.Sequential(
-            nn.Conv1d(self.config.input_channels, self.config.stem_channels, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm1d(self.config.stem_channels),
+            nn.Conv1d(self.config.input_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm1d(base_channels),
             nn.GELU(),
         )
         self.stage1 = nn.Sequential(
-            ResidualBlock1D(self.config.stem_channels, self.config.stem_channels),
-            ResidualBlock1D(self.config.stem_channels, self.config.stem_channels),
+            ResidualBlock1D(base_channels, base_channels),
+            ResidualBlock1D(base_channels, base_channels),
         )
         self.stage2 = nn.Sequential(
-            ResidualBlock1D(self.config.stem_channels, stage2_channels, stride=2),
+            ResidualBlock1D(base_channels, stage2_channels, stride=2),
             ResidualBlock1D(stage2_channels, stage2_channels),
         )
         self.stage3 = nn.Sequential(
             ResidualBlock1D(stage2_channels, stage3_channels, stride=2),
             ResidualBlock1D(stage3_channels, stage3_channels),
         )
+        self.stage4 = nn.Sequential(
+            ResidualBlock1D(stage3_channels, stage4_channels, stride=2),
+            ResidualBlock1D(stage4_channels, stage4_channels),
+        )
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Sequential(
-            nn.Linear(stage3_channels, self.config.hidden_channels),
+            nn.Linear(stage4_channels, self.config.hidden_channels),
             nn.GELU(),
             nn.Dropout(self.config.dropout),
             nn.Linear(self.config.hidden_channels, 3),
@@ -329,8 +401,106 @@ class ResNetRegressionNet(nn.Module):
         x = self.stage1(x)
         x = self.stage2(x)
         x = self.stage3(x)
+        x = self.stage4(x)
         x = self.pool(x).squeeze(-1)
         return DirectRegressionPredictions(normalized_params=self.head(x))
+
+
+class TCNRegressionNet(nn.Module):
+    def __init__(self, config: ModelConfig | None = None):
+        super().__init__()
+        self.config = config or ModelConfig(architecture="tcn_regression", input_channels=2)
+        channels = max(self.config.hidden_channels, 128)
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(self.config.input_channels, channels, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList(
+            [
+                TemporalBlock1D(channels, dilation=1, dropout=self.config.dropout),
+                TemporalBlock1D(channels, dilation=2, dropout=self.config.dropout),
+                TemporalBlock1D(channels, dilation=4, dropout=self.config.dropout),
+                TemporalBlock1D(channels, dilation=8, dropout=self.config.dropout),
+            ]
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.head = nn.Sequential(
+            nn.Linear(channels, self.config.hidden_channels),
+            nn.GELU(),
+            nn.Dropout(self.config.dropout),
+            nn.Linear(self.config.hidden_channels, 3),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, iq: torch.Tensor) -> DirectRegressionPredictions:
+        x = self.stem(iq)
+        for block in self.blocks:
+            x = block(x)
+        x = self.pool(x).squeeze(-1)
+        return DirectRegressionPredictions(normalized_params=self.head(x))
+
+
+class DenseNetRegressionNet(nn.Module):
+    def __init__(self, config: ModelConfig | None = None):
+        super().__init__()
+        self.config = config or ModelConfig(architecture="densenet_regression", input_channels=2)
+        growth_rate = 32
+        block_config = [6, 12, 24, 16]
+        bn_size = 4
+        init_features = 64
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(self.config.input_channels, init_features, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm1d(init_features),
+            nn.GELU(),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
+        )
+
+        num_features = init_features
+        self.blocks = nn.ModuleList()
+        self.transitions = nn.ModuleList()
+        for idx, num_layers in enumerate(block_config):
+            block = nn.Sequential(
+                *[
+                    DenseLayer1D(
+                        in_channels=num_features + i * growth_rate,
+                        growth_rate=growth_rate,
+                        bn_size=bn_size,
+                        dropout=self.config.dropout,
+                    )
+                    for i in range(num_layers)
+                ]
+            )
+            self.blocks.append(block)
+            num_features = num_features + num_layers * growth_rate
+            if idx != len(block_config) - 1:
+                out_features = num_features // 2
+                self.transitions.append(Transition1D(num_features, out_features))
+                num_features = out_features
+
+        self.final_num_features = num_features
+        self.final_norm = nn.BatchNorm1d(num_features)
+        self.final_act = nn.GELU()
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Sequential(
+            nn.Linear(num_features, self.config.hidden_channels),
+            nn.GELU(),
+            nn.Dropout(self.config.dropout),
+            nn.Linear(self.config.hidden_channels, 3),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, iq: torch.Tensor) -> DirectRegressionPredictions:
+        x = self.stem(iq)
+        for idx, block in enumerate(self.blocks):
+            x = block(x)
+            if idx < len(self.transitions):
+                x = self.transitions[idx](x)
+        x = self.final_act(self.final_norm(x))
+        x = self.pool(x).squeeze(-1)
+        return DirectRegressionPredictions(normalized_params=self.classifier(x))
 
 
 class GateReconstructionNet(nn.Module):
@@ -437,4 +607,8 @@ def build_model(config: ModelConfig | None = None) -> nn.Module:
         return GateReconstructionNet(resolved)
     if architecture == "resnet_regression":
         return ResNetRegressionNet(resolved)
+    if architecture == "tcn_regression":
+        return TCNRegressionNet(resolved)
+    if architecture == "densenet_regression":
+        return DenseNetRegressionNet(resolved)
     raise ValueError(f"Unsupported architecture '{resolved.architecture}'.")

@@ -61,3 +61,35 @@ def test_resnet_regression_builds_and_outputs_three_values() -> None:
     predictions = model(iq)
 
     assert predictions.normalized_params.shape == (2, 3)
+
+
+def test_tcn_regression_builds_and_outputs_three_values() -> None:
+    model = build_model(
+        ModelConfig(
+            architecture="tcn_regression",
+            input_channels=2,
+            stem_channels=32,
+            hidden_channels=128,
+        )
+    )
+    iq = torch.randn(2, 2, 4000)
+
+    predictions = model(iq)
+
+    assert predictions.normalized_params.shape == (2, 3)
+
+
+def test_densenet_regression_builds_and_outputs_three_values() -> None:
+    model = build_model(
+        ModelConfig(
+            architecture="densenet_regression",
+            input_channels=2,
+            stem_channels=32,
+            hidden_channels=128,
+        )
+    )
+    iq = torch.randn(2, 2, 4000)
+
+    predictions = model(iq)
+
+    assert predictions.normalized_params.shape == (2, 3)
