@@ -11,3 +11,6 @@ __pycache__/
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+.DS_Store
+.venv/
+server_results/
